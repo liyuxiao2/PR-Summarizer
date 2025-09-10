@@ -4,6 +4,7 @@ PR Summarizer - A tool to generate concise summaries of GitHub Pull Requests
 
 This script fetches PR data from GitHub and generates human-readable summaries
 using either HuggingFace transformers or OpenAI API for text summarization.
+Can run as a webhook server to automatically update PR descriptions.
 """
 
 import os
@@ -11,9 +12,12 @@ import sys
 import argparse
 import requests
 import re
+import hmac
+import hashlib
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import json
+from flask import Flask, request, jsonify
 
 try:
     from transformers import pipeline, BartTokenizer
@@ -260,6 +264,32 @@ class PRSummarizer:
         # Fallback to manual summary
         return self._create_manual_summary(pr_data)
     
+    def update_pr_description(self, repo_owner: str, repo_name: str, pr_number: int, new_description: str) -> bool:
+        """
+        Update the PR description with the generated summary
+        
+        Args:
+            repo_owner: GitHub repository owner
+            repo_name: GitHub repository name
+            pr_number: Pull request number
+            new_description: New description to set for the PR
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            base_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
+            update_data = {"body": new_description}
+            
+            response = self.session.patch(f"{base_url}/pulls/{pr_number}", json=update_data)
+            response.raise_for_status()
+            
+            return True
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to update PR description: {str(e)}")
+            return False
+    
     def _create_manual_summary(self, pr_data: PRData) -> str:
         """Create a manual summary when AI services are unavailable"""
         summary_points = []
@@ -304,6 +334,112 @@ class PRSummarizer:
         return "\n".join(summary_points[:5])  # Limit to 5 points
 
 
+class WebhookHandler:
+    """Handles GitHub webhook events for automatic PR summarization"""
+    
+    def __init__(self, github_token: str, openai_key: Optional[str] = None, webhook_secret: Optional[str] = None):
+        self.github_token = github_token
+        self.openai_key = openai_key
+        self.webhook_secret = webhook_secret
+        self.summarizer = PRSummarizer(github_token, openai_key)
+    
+    def verify_signature(self, payload_body: bytes, signature_header: str) -> bool:
+        """Verify the webhook signature for security"""
+        if not self.webhook_secret:
+            return True  # Skip verification if no secret is configured
+        
+        if not signature_header:
+            return False
+        
+        try:
+            expected_signature = 'sha256=' + hmac.new(
+                self.webhook_secret.encode('utf-8'),
+                payload_body,
+                hashlib.sha256
+            ).hexdigest()
+            
+            return hmac.compare_digest(expected_signature, signature_header)
+        except Exception:
+            return False
+    
+    def handle_pull_request_event(self, payload: dict) -> dict:
+        """Handle pull request webhook event"""
+        try:
+            action = payload.get('action')
+            
+            # Only process opened PRs
+            if action != 'opened':
+                return {'status': 'ignored', 'reason': f'Action "{action}" not handled'}
+            
+            pr_data = payload.get('pull_request', {})
+            repo_data = payload.get('repository', {})
+            
+            # Extract necessary information
+            repo_owner = repo_data.get('owner', {}).get('login')
+            repo_name = repo_data.get('name')
+            pr_number = pr_data.get('number')
+            
+            if not all([repo_owner, repo_name, pr_number]):
+                return {'status': 'error', 'message': 'Missing required PR information'}
+            
+            print(f"Processing PR #{pr_number} in {repo_owner}/{repo_name}")
+            
+            # Fetch PR data and generate summary
+            pr_info = self.summarizer.fetch_pr_data(repo_owner, repo_name, pr_number)
+            summary = self.summarizer.generate_summary(pr_info)
+            
+            # Prepare the new description
+            original_description = pr_info.description or ""
+            separator = "\n\n---\n\n**Auto-generated Summary:**\n"
+            new_description = original_description + separator + summary
+            
+            # Update the PR description
+            success = self.summarizer.update_pr_description(repo_owner, repo_name, pr_number, new_description)
+            
+            if success:
+                print(f"Successfully updated PR #{pr_number} description")
+                return {'status': 'success', 'pr_number': pr_number, 'repo': f'{repo_owner}/{repo_name}'}
+            else:
+                return {'status': 'error', 'message': 'Failed to update PR description'}
+                
+        except Exception as e:
+            print(f"Error processing webhook: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+
+def create_app(github_token: str, openai_key: Optional[str] = None, webhook_secret: Optional[str] = None) -> Flask:
+    """Create Flask application for webhook handling"""
+    app = Flask(__name__)
+    webhook_handler = WebhookHandler(github_token, openai_key, webhook_secret)
+    
+    @app.route('/webhook', methods=['POST'])
+    def github_webhook():
+        # Verify signature
+        signature = request.headers.get('X-Hub-Signature-256', '')
+        if not webhook_handler.verify_signature(request.data, signature):
+            return jsonify({'error': 'Invalid signature'}), 401
+        
+        # Parse payload
+        try:
+            payload = request.json
+        except Exception:
+            return jsonify({'error': 'Invalid JSON payload'}), 400
+        
+        # Handle pull request events
+        if request.headers.get('X-GitHub-Event') == 'pull_request':
+            result = webhook_handler.handle_pull_request_event(payload)
+            status_code = 200 if result['status'] == 'success' else 400
+            return jsonify(result), status_code
+        
+        return jsonify({'status': 'ignored', 'reason': 'Event not handled'}), 200
+    
+    @app.route('/health', methods=['GET'])
+    def health_check():
+        return jsonify({'status': 'healthy', 'service': 'PR Summarizer Webhook'})
+    
+    return app
+
+
 def parse_github_url(url: str) -> Tuple[str, str, int]:
     """
     Parse GitHub PR URL to extract owner, repo, and PR number
@@ -327,11 +463,33 @@ def parse_github_url(url: str) -> Tuple[str, str, int]:
 def main():
     """Main function to run the PR summarizer"""
     parser = argparse.ArgumentParser(description="Generate summaries for GitHub Pull Requests")
-    parser.add_argument('pr_url', help='GitHub PR URL (e.g., https://github.com/owner/repo/pull/123)')
-    parser.add_argument('--github-token', help='GitHub API token (or set GITHUB_TOKEN env var)')
-    parser.add_argument('--openai-key', help='OpenAI API key for better summaries (optional)')
     
-    args = parser.parse_args()
+    # Add subcommands for CLI and webhook modes
+    subparsers = parser.add_subparsers(dest='mode', help='Operation mode')
+    
+    # CLI mode (original functionality)
+    cli_parser = subparsers.add_parser('cli', help='CLI mode: summarize a specific PR')
+    cli_parser.add_argument('pr_url', help='GitHub PR URL (e.g., https://github.com/owner/repo/pull/123)')
+    cli_parser.add_argument('--github-token', help='GitHub API token (or set GITHUB_TOKEN env var)')
+    cli_parser.add_argument('--openai-key', help='OpenAI API key for better summaries (optional)')
+    
+    # Webhook mode
+    webhook_parser = subparsers.add_parser('webhook', help='Webhook mode: run as a server to handle GitHub webhooks')
+    webhook_parser.add_argument('--port', type=int, default=5000, help='Port to run webhook server on (default: 5000)')
+    webhook_parser.add_argument('--host', default='0.0.0.0', help='Host to bind webhook server to (default: 0.0.0.0)')
+    webhook_parser.add_argument('--github-token', help='GitHub API token (or set GITHUB_TOKEN env var)')
+    webhook_parser.add_argument('--openai-key', help='OpenAI API key for better summaries (optional)')
+    webhook_parser.add_argument('--webhook-secret', help='GitHub webhook secret for signature verification (or set WEBHOOK_SECRET env var)')
+    
+    # Default to CLI mode for backward compatibility when no subcommand is provided
+    if len(sys.argv) > 1 and not sys.argv[1].startswith('-') and sys.argv[1] not in ['cli', 'webhook']:
+        # This is the old format - treat as CLI mode
+        args = parser.parse_args(['cli'] + sys.argv[1:])
+    else:
+        args = parser.parse_args()
+        if args.mode is None:
+            parser.print_help()
+            sys.exit(1)
     
     # Get GitHub token
     github_token = args.github_token or os.getenv('GITHUB_TOKEN')
@@ -342,38 +500,61 @@ def main():
     # Get OpenAI key (optional)
     openai_key = args.openai_key or os.getenv('OPENAI_API_KEY')
     
-    try:
-        # Parse the GitHub URL
-        owner, repo, pr_number = parse_github_url(args.pr_url)
-        print(f"Analyzing PR #{pr_number} in {owner}/{repo}...")
+    if args.mode == 'cli':
+        # Original CLI functionality
+        try:
+            # Parse the GitHub URL
+            owner, repo, pr_number = parse_github_url(args.pr_url)
+            print(f"Analyzing PR #{pr_number} in {owner}/{repo}...")
+            
+            # Initialize summarizer
+            summarizer = PRSummarizer(github_token, openai_key)
+            
+            # Fetch PR data
+            print("Fetching PR data from GitHub...")
+            pr_data = summarizer.fetch_pr_data(owner, repo, pr_number)
+            
+            # Generate summary
+            print("Generating summary...")
+            summary = summarizer.generate_summary(pr_data)
+            
+            # Output results
+            print("\n" + "="*60)
+            print("PULL REQUEST SUMMARY")
+            print("="*60)
+            print(summary)
+            print("="*60)
+            
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        except GitHubAPIError as e:
+            print(f"GitHub API Error: {e}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            sys.exit(1)
+    
+    elif args.mode == 'webhook':
+        # Webhook server mode
+        webhook_secret = args.webhook_secret or os.getenv('WEBHOOK_SECRET')
         
-        # Initialize summarizer
-        summarizer = PRSummarizer(github_token, openai_key)
+        print("Starting PR Summarizer Webhook Server...")
+        print(f"Host: {args.host}")
+        print(f"Port: {args.port}")
+        print(f"Webhook endpoint: http://{args.host}:{args.port}/webhook")
+        print(f"Health check: http://{args.host}:{args.port}/health")
+        print(f"Signature verification: {'Enabled' if webhook_secret else 'Disabled'}")
         
-        # Fetch PR data
-        print("Fetching PR data from GitHub...")
-        pr_data = summarizer.fetch_pr_data(owner, repo, pr_number)
+        app = create_app(github_token, openai_key, webhook_secret)
         
-        # Generate summary
-        print("Generating summary...")
-        summary = summarizer.generate_summary(pr_data)
-        
-        # Output results
-        print("\n" + "="*60)
-        print("PULL REQUEST SUMMARY")
-        print("="*60)
-        print(summary)
-        print("="*60)
-        
-    except ValueError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-    except GitHubAPIError as e:
-        print(f"GitHub API Error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        sys.exit(1)
+        try:
+            app.run(host=args.host, port=args.port, debug=False)
+        except KeyboardInterrupt:
+            print("\nShutting down webhook server...")
+        except Exception as e:
+            print(f"Error running webhook server: {e}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
