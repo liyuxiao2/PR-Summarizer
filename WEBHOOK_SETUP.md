@@ -1,6 +1,6 @@
 # Webhook Setup Guide
 
-This guide explains how to set up the PR Summarizer as a GitHub webhook to automatically update PR descriptions with AI-generated summaries.
+This guide explains how to set up the PR Summarizer as a GitHub webhook to automatically update PR descriptions with AI-generated summaries using the open-source OpenAI model.
 
 ## Quick Start
 
@@ -89,7 +89,7 @@ Your GitHub token needs these permissions:
 1. When a PR is **opened** in your repository, GitHub sends a webhook event
 2. The webhook server receives the event and verifies the signature (if configured)
 3. The server fetches comprehensive PR data using GitHub API
-4. An AI-generated summary is created using OpenAI API or HuggingFace transformers
+4. An AI-generated summary is created using the open-source OpenAI model "openai/gpt-oss-20b" or OpenAI API as fallback
 5. The PR description is updated with the original content plus the auto-generated summary
 
 ## Example Updated PR Description
@@ -119,12 +119,18 @@ Your GitHub token needs these permissions:
 
 ### API Rate Limits
 - GitHub API: 5,000 requests/hour for authenticated users
-- OpenAI API: Varies by plan and model
+- OpenAI API: Varies by plan and model (only used as fallback)
+
+### Hardware Requirements
+- At least 16GB RAM (32GB recommended) for running the open-source model
+- GPU with 8GB+ VRAM recommended for faster processing
+- ~20GB free disk space for model files
 
 ### Server Errors
 - Check server logs for detailed error messages
 - Verify GitHub token permissions
 - Ensure all required dependencies are installed
+- Check if your server has enough resources to run the open-source model
 
 ## Security Considerations
 

@@ -66,21 +66,31 @@ set OPENAI_API_KEY=your_openai_key_here
 ### Basic Usage
 
 ```bash
-python pr_summarizer.py https://github.com/owner/repo/pull/123
+# CLI mode (summarize a specific PR)
+python pr_summarizer.py cli https://github.com/owner/repo/pull/123
 ```
 
 ### With Command Line Arguments
 
 ```bash
 # Specify tokens via command line
-python pr_summarizer.py https://github.com/owner/repo/pull/123 --github-token YOUR_TOKEN --openai-key YOUR_OPENAI_KEY
+python pr_summarizer.py cli https://github.com/owner/repo/pull/123 --github-token YOUR_TOKEN --openai-key YOUR_OPENAI_KEY
+```
+
+### Webhook Server Mode
+
+```bash
+# Run as a webhook server
+python pr_summarizer.py webhook --github-token YOUR_TOKEN --port 5000
 ```
 
 ### Example
 
 ```bash
-python pr_summarizer.py https://github.com/microsoft/vscode/pull/12345
+python pr_summarizer.py cli https://github.com/microsoft/vscode/pull/12345
 ```
+
+For more details on setting up the webhook server, see [WEBHOOK_SETUP.md](WEBHOOK_SETUP.md).
 
 ## Output
 
