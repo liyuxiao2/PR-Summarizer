@@ -20,17 +20,21 @@ import json
 from flask import Flask, request, jsonify
 
 try:
-    from transformers import pipeline, BartTokenizer
+    from transformers import pipeline
     import torch
-    TRANSFORMERS_AVAILABLE = True
+    OPENAI_OSS_AVAILABLE = True
 except ImportError:
-    TRANSFORMERS_AVAILABLE = False
+    OPENAI_OSS_AVAILABLE = False
 
+# Import for OpenAI API
+OPENAI_AVAILABLE = False
+OpenAI = None
 try:
     import openai
+    from openai import OpenAI
     OPENAI_AVAILABLE = True
 except ImportError:
-    OPENAI_AVAILABLE = False
+    pass
 
 
 @dataclass
@@ -62,8 +66,14 @@ class PRSummarizer:
             'Accept': 'application/vnd.github.v3+json'
         })
         
-        if openai_key:
-            openai.api_key = openai_key
+        # Initialize OpenAI client if API key is provided and library is available
+        self.openai_client = None
+        if openai_key and OPENAI_AVAILABLE and OpenAI is not None:
+            try:
+                self.openai_client = OpenAI(api_key=openai_key)
+            except Exception:
+                # If OpenAI client initialization fails, keep it as None
+                pass
     
     def fetch_pr_data(self, repo_owner: str, repo_name: str, pr_number: int) -> PRData:
         """
@@ -178,22 +188,6 @@ class PRSummarizer:
         
         return ". ".join(change_summary)
     
-    def _summarize_with_transformers(self, text: str) -> str:
-        """Summarize text using HuggingFace transformers"""
-        try:
-            summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
-            
-            # BART has a max input length, so we truncate if necessary
-            max_length = 1024
-            if len(text) > max_length:
-                text = text[:max_length]
-            
-            result = summarizer(text, max_length=150, min_length=50, do_sample=False)
-            return result[0]['summary_text']
-        
-        except Exception as e:
-            return f"Error in transformer summarization: {str(e)}"
-    
     def _summarize_with_open_source_model(self, text: str) -> str:
         """Summarize text using the open-source OpenAI model"""
         try:
@@ -221,7 +215,11 @@ class PRSummarizer:
             )
             
             # Extract and return the generated text
-            return outputs[0]["generated_text"]
+            # Convert the output to string if it's not already
+            result = outputs[0]["generated_text"]
+            if isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict) and "content" in result[0]:
+                return result[0]["content"]
+            return str(result)
         
         except Exception as e:
             return f"Error in open-source model summarization: {str(e)}"
@@ -229,7 +227,10 @@ class PRSummarizer:
     def _summarize_with_openai(self, text: str) -> str:
         """Summarize text using OpenAI API"""
         try:
-            response = openai.ChatCompletion.create(
+            if not self.openai_client:
+                return "Error in OpenAI summarization: OpenAI client not initialized"
+                
+            response = self.openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant that creates concise summaries of code changes and pull requests."},
@@ -238,7 +239,15 @@ class PRSummarizer:
                 max_tokens=300,
                 temperature=0.3
             )
-            return response.choices[0].message.content.strip()
+            # Safely extract content from response
+            try:
+                if hasattr(response.choices[0].message, 'content'):
+                    content = response.choices[0].message.content
+                    if content is not None:
+                        return content.strip()
+                return "No content in response"
+            except (AttributeError, IndexError):
+                return "Error parsing OpenAI response"
         
         except Exception as e:
             return f"Error in OpenAI summarization: {str(e)}"
@@ -283,21 +292,15 @@ class PRSummarizer:
         
         full_text = "\n".join(summary_parts)
         
-        # Try to use the open-source OpenAI model first if transformers are available
-        if TRANSFORMERS_AVAILABLE:
+        # Try to use the open-source OpenAI model first
+        if OPENAI_OSS_AVAILABLE:
             ai_summary = self._summarize_with_open_source_model(full_text)
             if not ai_summary.startswith("Error"):
                 return ai_summary
         
         # Fall back to OpenAI API if available
-        if self.openai_key and OPENAI_AVAILABLE:
+        if self.openai_client and OPENAI_AVAILABLE:
             ai_summary = self._summarize_with_openai(full_text)
-            if not ai_summary.startswith("Error"):
-                return ai_summary
-        
-        # Fall back to the original transformer model
-        if TRANSFORMERS_AVAILABLE:
-            ai_summary = self._summarize_with_transformers(full_text)
             if not ai_summary.startswith("Error"):
                 return ai_summary
         
@@ -462,6 +465,8 @@ def create_app(github_token: str, openai_key: Optional[str] = None, webhook_secr
         # Parse payload
         try:
             payload = request.json
+            if payload is None:
+                return jsonify({'error': 'Invalid JSON payload'}), 400
         except Exception:
             return jsonify({'error': 'Invalid JSON payload'}), 400
         
