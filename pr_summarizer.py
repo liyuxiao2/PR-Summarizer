@@ -21,6 +21,7 @@ from flask import Flask, request, jsonify
 
 try:
     from transformers import pipeline, BartTokenizer
+    import torch
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
@@ -193,6 +194,38 @@ class PRSummarizer:
         except Exception as e:
             return f"Error in transformer summarization: {str(e)}"
     
+    def _summarize_with_open_source_model(self, text: str) -> str:
+        """Summarize text using the open-source OpenAI model"""
+        try:
+            from transformers import pipeline
+            import torch
+            
+            # Initialize the model
+            model_id = "openai/gpt-oss-20b"
+            pipe = pipeline(
+                "text-generation",
+                model=model_id,
+                torch_dtype="auto",
+                device_map="auto",
+            )
+            
+            # Prepare messages for the model
+            messages = [
+                {"role": "user", "content": f"Please provide a concise summary of this pull request in 3-5 bullet points:\n\n{text}"}
+            ]
+            
+            # Generate the response
+            outputs = pipe(
+                messages,
+                max_new_tokens=256,
+            )
+            
+            # Extract and return the generated text
+            return outputs[0]["generated_text"]
+        
+        except Exception as e:
+            return f"Error in open-source model summarization: {str(e)}"
+    
     def _summarize_with_openai(self, text: str) -> str:
         """Summarize text using OpenAI API"""
         try:
@@ -250,12 +283,19 @@ class PRSummarizer:
         
         full_text = "\n".join(summary_parts)
         
-        # Try to use AI summarization if available
+        # Try to use the open-source OpenAI model first if transformers are available
+        if TRANSFORMERS_AVAILABLE:
+            ai_summary = self._summarize_with_open_source_model(full_text)
+            if not ai_summary.startswith("Error"):
+                return ai_summary
+        
+        # Fall back to OpenAI API if available
         if self.openai_key and OPENAI_AVAILABLE:
             ai_summary = self._summarize_with_openai(full_text)
             if not ai_summary.startswith("Error"):
                 return ai_summary
         
+        # Fall back to the original transformer model
         if TRANSFORMERS_AVAILABLE:
             ai_summary = self._summarize_with_transformers(full_text)
             if not ai_summary.startswith("Error"):
